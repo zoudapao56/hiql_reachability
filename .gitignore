@@ -1,0 +1,93 @@
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+
+# Python tooling caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.pyre/
+.pytype/
+
+# IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+.ipynb_checkpoints/
+
+# Logs and temporary files
+*.log
+*.out
+*.err
+*.pid
+*.tmp
+*.temp
+wget-log
+
+# Local background launch logs/state
+/background_runs/
+
+# Weights & Biases local runs
+/wandb/
+
+# Training outputs, evaluation artifacts, generated figures/videos
+/experiment_output/
+/make_sbatch/
+/ipynbs/
+*.mp4
+*.gif
+
+# Offline datasets and generated dataset caches
+/data/
+/antmaze_aux/
+*.hdf5
+*.h5
+*.npz
+*.npy
+
+# Model checkpoints / serialized training artifacts
+*.pkl
+*.pickle
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+checkpoint*
+params_*.pkl
+
+# Large optional environment package/assets.
+# Keep core AntMaze code in src/, d4rl_ext/, and jaxrl_m/ tracked; do not upload CALVIN assets.
+/calvin/
+
+# Local accidental files
+=*
