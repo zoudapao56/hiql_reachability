@@ -19,6 +19,12 @@ class GCDataset:
     reward_shift: float = -1.0
     terminal: bool = True
     reachability_horizon: int = 25
+    reachability_anchor_eps: float = 0.75
+    reachability_far_eps: float = 5.0
+    reachability_negative_horizon: int = 200
+    reachability_hard_negative_prob: float = 0.75
+    reachability_anchor_max_candidates: int = 64
+    reachability_anchor_sample_attempts: int = 16
 
     @staticmethod
     def get_default_config():
@@ -31,12 +37,106 @@ class GCDataset:
             'reward_shift': -1.0,
             'terminal': True,
             'reachability_horizon': 25,
+            'reachability_anchor_eps': 0.75,
+            'reachability_far_eps': 5.0,
+            'reachability_negative_horizon': 200,
+            'reachability_hard_negative_prob': 0.75,
+            'reachability_anchor_max_candidates': 64,
+            'reachability_anchor_sample_attempts': 16,
         })
 
     def __post_init__(self):
         self.terminal_locs, = np.nonzero(self.dataset[self.terminal_key] > 0)
         self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
         assert np.isclose(self.p_randomgoal + self.p_trajgoal + self.p_currgoal, 1.0)
+        self._build_reachability_spatial_index()
+
+    def _build_reachability_spatial_index(self):
+        observations = self.dataset['observations']
+        if isinstance(observations, FrozenDict) or not hasattr(observations, 'shape') or observations.shape[-1] < 2:
+            self.reachability_obs_xy = None
+            self.reachability_spatial_bins = None
+            return
+
+        self.reachability_obs_xy = np.asarray(observations[..., :2])
+        eps = max(float(self.reachability_anchor_eps), 1e-6)
+        cells = np.floor(self.reachability_obs_xy / eps).astype(np.int32)
+        spatial_bins = {}
+        for idx, cell in enumerate(cells):
+            key = (int(cell[0]), int(cell[1]))
+            spatial_bins.setdefault(key, []).append(idx)
+        self.reachability_spatial_bins = {
+            key: np.asarray(indices, dtype=np.int32)
+            for key, indices in spatial_bins.items()
+        }
+
+    def _query_reachability_anchors(self, xy):
+        if self.reachability_obs_xy is None or self.reachability_spatial_bins is None:
+            return None
+
+        eps = max(float(self.reachability_anchor_eps), 1e-6)
+        cell = np.floor(xy / eps).astype(np.int32)
+        candidates = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                key = (int(cell[0] + dx), int(cell[1] + dy))
+                if key in self.reachability_spatial_bins:
+                    candidates.append(self.reachability_spatial_bins[key])
+        if not candidates:
+            return None
+
+        candidates = np.concatenate(candidates)
+        distances = np.linalg.norm(self.reachability_obs_xy[candidates] - xy, axis=-1)
+        anchors = candidates[distances < eps]
+        if anchors.size == 0:
+            return None
+
+        max_candidates = int(self.reachability_anchor_max_candidates)
+        if max_candidates > 0 and anchors.size > max_candidates:
+            anchors = np.random.choice(anchors, size=max_candidates, replace=False)
+        return anchors
+
+    def _sample_reachability_anchor(self, xy, fallback_idx):
+        if self.reachability_obs_xy is None or self.reachability_spatial_bins is None:
+            return fallback_idx
+
+        eps = max(float(self.reachability_anchor_eps), 1e-6)
+        cell = np.floor(xy / eps).astype(np.int32)
+        neighbor_bins = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                key = (int(cell[0] + dx), int(cell[1] + dy))
+                if key in self.reachability_spatial_bins:
+                    neighbor_bins.append(self.reachability_spatial_bins[key])
+        if not neighbor_bins:
+            return fallback_idx
+
+        for _ in range(int(self.reachability_anchor_sample_attempts)):
+            bin_indices = neighbor_bins[np.random.randint(len(neighbor_bins))]
+            candidate = bin_indices[np.random.randint(len(bin_indices))]
+            if np.linalg.norm(self.reachability_obs_xy[candidate] - xy) < eps:
+                return candidate
+        return fallback_idx
+
+    def _sample_future_index(self, anchor_idx, min_offset, max_offset):
+        final_state_indx = self.terminal_locs[np.searchsorted(self.terminal_locs, anchor_idx)]
+        start = anchor_idx + min_offset
+        end = min(anchor_idx + max_offset, final_state_indx)
+        if start > end:
+            return None
+        return np.random.randint(start, end + 1)
+
+    def _sample_far_index(self, xy):
+        if self.reachability_obs_xy is None:
+            return np.random.randint(self.dataset.size)
+
+        far_eps = float(self.reachability_far_eps)
+        goal_indx = np.random.randint(self.dataset.size)
+        for _ in range(16):
+            if np.linalg.norm(self.reachability_obs_xy[goal_indx] - xy) > far_eps:
+                return goal_indx
+            goal_indx = np.random.randint(self.dataset.size)
+        return goal_indx
 
     def sample_goals(self, indx, p_randomgoal=None, p_trajgoal=None, p_currgoal=None):
         if p_randomgoal is None:
@@ -68,25 +168,37 @@ class GCDataset:
 
     def sample_reachability_goals(self, indx):
         batch_size = len(indx)
-        final_state_indx = self.terminal_locs[np.searchsorted(self.terminal_locs, indx)]
-        episode_indx = np.searchsorted(self.terminal_locs, indx)
-
-        max_offsets = np.maximum(1, np.minimum(self.reachability_horizon, final_state_indx - indx))
-        pos_offsets = np.floor(np.random.rand(batch_size) * max_offsets).astype(int) + 1
-        positive_goal_indx = np.minimum(indx + pos_offsets, final_state_indx)
-
-        negative_goal_indx = np.random.randint(self.dataset.size, size=batch_size)
-        for _ in range(8):
-            negative_episode_indx = np.searchsorted(self.terminal_locs, negative_goal_indx)
-            same_episode = negative_episode_indx == episode_indx
-            resampled = np.random.randint(self.dataset.size, size=batch_size)
-            negative_goal_indx = np.where(same_episode, resampled, negative_goal_indx)
-
         labels = (np.random.rand(batch_size) < 0.5).astype(np.float32)
-        reach_goal_indx = np.where(labels > 0.5, positive_goal_indx, negative_goal_indx)
+        reach_goal_indx = np.empty(batch_size, dtype=np.int32)
+
+        horizon = int(self.reachability_horizon)
+        negative_horizon = max(int(self.reachability_negative_horizon), horizon + 1)
+
+        for i, state_idx in enumerate(indx):
+            if self.reachability_obs_xy is None:
+                xy = None
+                anchor_idx = state_idx
+            else:
+                xy = self.reachability_obs_xy[state_idx]
+                anchor_idx = self._sample_reachability_anchor(xy, state_idx)
+
+            goal_idx = None
+            if labels[i] > 0.5:
+                goal_idx = self._sample_future_index(anchor_idx, 1, horizon)
+                if goal_idx is None:
+                    goal_idx = self._sample_far_index(xy) if xy is not None else np.random.randint(self.dataset.size)
+                    labels[i] = 0.0
+            else:
+                use_hard_negative = np.random.rand() < self.reachability_hard_negative_prob
+                if use_hard_negative:
+                    goal_idx = self._sample_future_index(anchor_idx, horizon + 1, negative_horizon)
+                if goal_idx is None:
+                    goal_idx = self._sample_far_index(xy) if xy is not None else np.random.randint(self.dataset.size)
+
+            reach_goal_indx[i] = goal_idx
         return reach_goal_indx, labels
 
-    def sample(self, batch_size: int, indx=None):
+    def sample(self, batch_size: int, indx=None, sample_reachability=True):
         if indx is None:
             indx = np.random.randint(self.dataset.size-1, size=batch_size)
         
@@ -100,9 +212,10 @@ class GCDataset:
         else:
             batch['masks'] = np.ones(batch_size)
         batch['goals'] = jax.tree_map(lambda arr: arr[goal_indx], self.dataset['observations'])
-        reach_goal_indx, reach_labels = self.sample_reachability_goals(indx)
-        batch['reachability_goals'] = jax.tree_map(lambda arr: arr[reach_goal_indx], self.dataset['observations'])
-        batch['reachability_labels'] = reach_labels
+        if sample_reachability:
+            reach_goal_indx, reach_labels = self.sample_reachability_goals(indx)
+            batch['reachability_goals'] = jax.tree_map(lambda arr: arr[reach_goal_indx], self.dataset['observations'])
+            batch['reachability_labels'] = reach_labels
 
         return batch
 
@@ -122,9 +235,15 @@ class GCSDataset(GCDataset):
             'reward_shift': 0.0,
             'terminal': False,
             'reachability_horizon': 25,
+            'reachability_anchor_eps': 0.75,
+            'reachability_far_eps': 5.0,
+            'reachability_negative_horizon': 200,
+            'reachability_hard_negative_prob': 0.75,
+            'reachability_anchor_max_candidates': 64,
+            'reachability_anchor_sample_attempts': 16,
         })
 
-    def sample(self, batch_size: int, indx=None):
+    def sample(self, batch_size: int, indx=None, sample_reachability=True):
         if indx is None:
             indx = np.random.randint(self.dataset.size-1, size=batch_size)
 
@@ -160,9 +279,10 @@ class GCSDataset(GCDataset):
 
         batch['high_goals'] = jax.tree_map(lambda arr: arr[high_goal_idx], self.dataset['observations'])
         batch['high_targets'] = jax.tree_map(lambda arr: arr[high_target_idx], self.dataset['observations'])
-        reach_goal_indx, reach_labels = self.sample_reachability_goals(indx)
-        batch['reachability_goals'] = jax.tree_map(lambda arr: arr[reach_goal_indx], self.dataset['observations'])
-        batch['reachability_labels'] = reach_labels
+        if sample_reachability:
+            reach_goal_indx, reach_labels = self.sample_reachability_goals(indx)
+            batch['reachability_goals'] = jax.tree_map(lambda arr: arr[reach_goal_indx], self.dataset['observations'])
+            batch['reachability_labels'] = reach_labels
 
         if isinstance(batch['goals'], FrozenDict):
             # Freeze the other observations

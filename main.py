@@ -59,10 +59,26 @@ flags.DEFINE_float('temperature', 1, '')
 flags.DEFINE_float('high_temperature', 1, '')
 flags.DEFINE_integer('use_reachability', 0, '')
 flags.DEFINE_integer('reachability_horizon', 25, '')
+flags.DEFINE_float('reachability_anchor_eps', 0.75, '')
+flags.DEFINE_float('reachability_far_eps', 5.0, '')
+flags.DEFINE_integer('reachability_negative_horizon', 200, '')
+flags.DEFINE_float('reachability_hard_negative_prob', 0.75, '')
+flags.DEFINE_integer('reachability_anchor_max_candidates', 64, '')
+flags.DEFINE_integer('reachability_anchor_sample_attempts', 16, '')
 flags.DEFINE_float('reachability_loss_weight', 1.0, '')
 flags.DEFINE_float('reachability_threshold', 0.5, '')
 flags.DEFINE_integer('reachability_resample_attempts', 10, '')
 flags.DEFINE_integer('reachability_filter_policy', 0, '')
+flags.DEFINE_integer('reachability_pretrain_steps', 0, '')
+flags.DEFINE_integer('freeze_reachability_after_pretrain', 0, '')
+flags.DEFINE_integer('reachability_start_step', -1, '')
+flags.DEFINE_float('reachability_start_frac', 0.0, '')
+flags.DEFINE_integer('use_reachability_mod_adv', 0, '')
+flags.DEFINE_float('reachability_alpha', 0.1, '')
+flags.DEFINE_integer('reachability_alpha_warmup_steps', 0, '')
+flags.DEFINE_float('reachability_alpha_max', -1.0, '')
+flags.DEFINE_float('reachability_alpha_min', -1.0, '')
+flags.DEFINE_integer('reachability_alpha_decay_steps', 0, '')
 
 flags.DEFINE_integer('visual', 0, '')
 flags.DEFINE_string('encoder', 'impala', '')
@@ -149,7 +165,20 @@ def _prob_summary(prefix, probs, threshold):
     }
 
 
-def get_eval_reachability_stats(agent, trajs, use_rep=False):
+def _safe_corr(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return np.nan
+    x = x[mask]
+    y = y[mask]
+    if np.std(x) < 1e-8 or np.std(y) < 1e-8:
+        return np.nan
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def get_eval_reachability_stats(agent, trajs, use_rep=False, reachability_alpha_effective=0.0):
     valid_trajs = [
         (traj_id, traj, np.sum(traj['reward']) > 0)
         for traj_id, traj in enumerate(trajs)
@@ -159,8 +188,22 @@ def get_eval_reachability_stats(agent, trajs, use_rep=False):
         return {}, []
 
     observations = np.concatenate([np.asarray(traj['observation']) for _, traj, _ in valid_trajs], axis=0)
+    next_observations = np.concatenate([np.asarray(traj['next_observation']) for _, traj, _ in valid_trajs], axis=0)
     subgoals = np.concatenate([np.asarray(traj['subgoal']) for _, traj, _ in valid_trajs], axis=0)
     episode_goals = np.concatenate([np.asarray(traj['episode_goal']) for _, traj, _ in valid_trajs], axis=0)
+    horizon = int(agent.config['way_steps'])
+    future_observations = []
+    for _, traj, _ in valid_trajs:
+        traj_observations = np.asarray(traj['observation'])
+        traj_next_observations = np.asarray(traj['next_observation'])
+        traj_len = len(traj_observations)
+        for t in range(traj_len):
+            future_t = t + horizon
+            if future_t < traj_len:
+                future_observations.append(traj_observations[future_t])
+            else:
+                future_observations.append(traj_next_observations[-1])
+    future_observations = np.asarray(future_observations)
 
     success_mask = np.concatenate([
         np.full(len(traj['subgoal']), success, dtype=bool)
@@ -198,11 +241,27 @@ def get_eval_reachability_stats(agent, trajs, use_rep=False):
         goals=final_goals_for_r,
         low_dim_goals=use_rep,
     ))
+    value_adv = np.asarray(agent.predict_value_advantage(
+        observations=observations,
+        next_observations=future_observations,
+        goals=episode_goals,
+    ))
+    mod_adv = value_adv + reachability_alpha_effective * subgoal_probs * (value_adv > 0)
+
+    if observations.shape[-1] >= 2 and episode_goals.shape[-1] >= 2:
+        raw_final_goal_distance = np.linalg.norm(episode_goals[..., :2] - observations[..., :2], axis=-1)
+        future_final_goal_distance = np.linalg.norm(episode_goals[..., :2] - future_observations[..., :2], axis=-1)
+    else:
+        raw_final_goal_distance = np.linalg.norm(episode_goals - observations, axis=-1)
+        future_final_goal_distance = np.linalg.norm(episode_goals - future_observations, axis=-1)
+    distance_progress = raw_final_goal_distance - future_final_goal_distance
 
     threshold = float(agent.config['reachability_threshold'])
     stats = {
         'reachability/success_traj_count': sum(success for _, _, success in valid_trajs),
         'reachability/failure_traj_count': sum(not success for _, _, success in valid_trajs),
+        'reachability/distance_progress_horizon': horizon,
+        'reachability/alpha_effective': reachability_alpha_effective,
     }
     for name, mask in [('success', success_mask), ('failure', ~success_mask), ('all', np.ones_like(success_mask, dtype=bool))]:
         stats.update(_prob_summary(f'reachability/{name}_subgoal_prob', subgoal_probs[mask], threshold))
@@ -210,9 +269,29 @@ def get_eval_reachability_stats(agent, trajs, use_rep=False):
         if mask.any():
             stats[f'reachability/{name}_subgoal_distance_mean'] = subgoal_distance[mask].mean()
             stats[f'reachability/{name}_final_goal_distance_mean'] = final_goal_distance[mask].mean()
+            stats[f'reachability/{name}_raw_final_goal_distance_mean'] = raw_final_goal_distance[mask].mean()
+            stats[f'reachability/{name}_future_final_goal_distance_mean'] = future_final_goal_distance[mask].mean()
+            stats[f'reachability/{name}_distance_progress_mean'] = distance_progress[mask].mean()
+            stats[f'reachability/{name}_value_adv_mean'] = value_adv[mask].mean()
+            stats[f'reachability/{name}_mod_adv_mean'] = mod_adv[mask].mean()
+            stats[f'reachability/{name}_r_vs_distance_progress_corr'] = _safe_corr(subgoal_probs[mask], distance_progress[mask])
+            stats[f'reachability/{name}_r_vs_subgoal_distance_corr'] = _safe_corr(subgoal_probs[mask], subgoal_distance[mask])
+            stats[f'reachability/{name}_adv_vs_r_corr'] = _safe_corr(value_adv[mask], subgoal_probs[mask])
+            stats[f'reachability/{name}_mod_adv_vs_r_corr'] = _safe_corr(mod_adv[mask], subgoal_probs[mask])
+            stats[f'reachability/{name}_mod_adv_vs_distance_progress_corr'] = _safe_corr(mod_adv[mask], distance_progress[mask])
         else:
             stats[f'reachability/{name}_subgoal_distance_mean'] = np.nan
             stats[f'reachability/{name}_final_goal_distance_mean'] = np.nan
+            stats[f'reachability/{name}_raw_final_goal_distance_mean'] = np.nan
+            stats[f'reachability/{name}_future_final_goal_distance_mean'] = np.nan
+            stats[f'reachability/{name}_distance_progress_mean'] = np.nan
+            stats[f'reachability/{name}_value_adv_mean'] = np.nan
+            stats[f'reachability/{name}_mod_adv_mean'] = np.nan
+            stats[f'reachability/{name}_r_vs_distance_progress_corr'] = np.nan
+            stats[f'reachability/{name}_r_vs_subgoal_distance_corr'] = np.nan
+            stats[f'reachability/{name}_adv_vs_r_corr'] = np.nan
+            stats[f'reachability/{name}_mod_adv_vs_r_corr'] = np.nan
+            stats[f'reachability/{name}_mod_adv_vs_distance_progress_corr'] = np.nan
 
     rows = []
     for idx in range(subgoal_probs.shape[0]):
@@ -224,6 +303,11 @@ def get_eval_reachability_stats(agent, trajs, use_rep=False):
             'final_goal_r': float(final_goal_probs[idx]),
             'subgoal_distance': float(subgoal_distance[idx]),
             'final_goal_distance': float(final_goal_distance[idx]),
+            'raw_final_goal_distance': float(raw_final_goal_distance[idx]),
+            'future_final_goal_distance': float(future_final_goal_distance[idx]),
+            'distance_progress': float(distance_progress[idx]),
+            'value_adv': float(value_adv[idx]),
+            'mod_adv': float(mod_adv[idx]),
         })
     return stats, rows
 
@@ -232,7 +316,13 @@ def append_reachability_samples(path, step, rows):
     if not rows:
         return
     file_exists = os.path.exists(path)
-    fieldnames = ['step', 'traj_id', 't', 'success', 'subgoal_r', 'final_goal_r', 'subgoal_distance', 'final_goal_distance']
+    fieldnames = [
+        'step', 'traj_id', 't', 'success',
+        'subgoal_r', 'final_goal_r',
+        'subgoal_distance', 'final_goal_distance',
+        'raw_final_goal_distance', 'future_final_goal_distance',
+        'distance_progress', 'value_adv', 'mod_adv',
+    ]
     with open(path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -285,6 +375,12 @@ def main(_):
     FLAGS.gcdataset['way_steps'] = FLAGS.way_steps
     FLAGS.gcdataset['discount'] = FLAGS.discount
     FLAGS.gcdataset['reachability_horizon'] = FLAGS.reachability_horizon
+    FLAGS.gcdataset['reachability_anchor_eps'] = FLAGS.reachability_anchor_eps
+    FLAGS.gcdataset['reachability_far_eps'] = FLAGS.reachability_far_eps
+    FLAGS.gcdataset['reachability_negative_horizon'] = FLAGS.reachability_negative_horizon
+    FLAGS.gcdataset['reachability_hard_negative_prob'] = FLAGS.reachability_hard_negative_prob
+    FLAGS.gcdataset['reachability_anchor_max_candidates'] = FLAGS.reachability_anchor_max_candidates
+    FLAGS.gcdataset['reachability_anchor_sample_attempts'] = FLAGS.reachability_anchor_sample_attempts
     FLAGS.config['pretrain_expectile'] = FLAGS.pretrain_expectile
     FLAGS.config['discount'] = FLAGS.discount
     FLAGS.config['temperature'] = FLAGS.temperature
@@ -299,10 +395,20 @@ def main(_):
     FLAGS.config['reachability_loss_weight'] = FLAGS.reachability_loss_weight
     FLAGS.config['reachability_threshold'] = FLAGS.reachability_threshold
     FLAGS.config['reachability_resample_attempts'] = FLAGS.reachability_resample_attempts
+    FLAGS.config['use_reachability_mod_adv'] = FLAGS.use_reachability_mod_adv
+    FLAGS.config['reachability_alpha'] = FLAGS.reachability_alpha
 
     # Create wandb logger
     params_dict = {**FLAGS.gcdataset.to_dict(), **FLAGS.config.to_dict()}
     params_dict['reachability_filter_policy'] = FLAGS.reachability_filter_policy
+    params_dict['reachability_pretrain_steps'] = FLAGS.reachability_pretrain_steps
+    params_dict['freeze_reachability_after_pretrain'] = FLAGS.freeze_reachability_after_pretrain
+    params_dict['reachability_start_step'] = FLAGS.reachability_start_step
+    params_dict['reachability_start_frac'] = FLAGS.reachability_start_frac
+    params_dict['reachability_alpha_warmup_steps'] = FLAGS.reachability_alpha_warmup_steps
+    params_dict['reachability_alpha_max'] = FLAGS.reachability_alpha_max
+    params_dict['reachability_alpha_min'] = FLAGS.reachability_alpha_min
+    params_dict['reachability_alpha_decay_steps'] = FLAGS.reachability_alpha_decay_steps
     FLAGS.wandb['name'] = FLAGS.wandb['exp_descriptor'] = exp_name
     FLAGS.wandb['group'] = FLAGS.wandb['exp_prefix'] = FLAGS.run_group
     setup_wandb(params_dict, **FLAGS.wandb)
@@ -438,7 +544,11 @@ def main(_):
     env.reset()
 
     pretrain_dataset = GCSDataset(dataset, **FLAGS.gcdataset.to_dict())
-    total_steps = FLAGS.pretrain_steps
+    total_steps = FLAGS.reachability_pretrain_steps + FLAGS.pretrain_steps
+    if FLAGS.reachability_start_step >= 0:
+        reachability_start_step = FLAGS.reachability_start_step
+    else:
+        reachability_start_step = int(FLAGS.pretrain_steps * FLAGS.reachability_start_frac)
     example_batch = dataset.sample(1)
     agent = learner.create_learner(FLAGS.seed,
                                    example_batch['observations'],
@@ -471,20 +581,91 @@ def main(_):
     for i in tqdm.tqdm(range(1, total_steps + 1),
                        smoothing=0.1,
                        dynamic_ncols=True):
-        pretrain_batch = pretrain_dataset.sample(FLAGS.batch_size)
-        agent, update_info = supply_rng(agent.pretrain_update)(pretrain_batch)
+        reachability_pretraining = i <= FLAGS.reachability_pretrain_steps
+        policy_step = i - FLAGS.reachability_pretrain_steps
+        if reachability_pretraining:
+            reachability_update = True
+            reachability_mod_adv = False
+            reachability_alpha_effective = 0.0
+        else:
+            scheduled_reachability = (
+                FLAGS.use_reachability
+                and policy_step >= reachability_start_step
+            )
+            reachability_frozen_after_pretrain = (
+                FLAGS.freeze_reachability_after_pretrain
+                and FLAGS.reachability_pretrain_steps > 0
+            )
+            reachability_update = scheduled_reachability and not reachability_frozen_after_pretrain
+            reachability_mod_adv = scheduled_reachability and FLAGS.use_reachability_mod_adv
+            if scheduled_reachability:
+                if FLAGS.reachability_alpha_decay_steps > 0:
+                    alpha_max = (
+                        FLAGS.reachability_alpha_max
+                        if FLAGS.reachability_alpha_max >= 0
+                        else FLAGS.reachability_alpha
+                    )
+                    alpha_min = (
+                        FLAGS.reachability_alpha_min
+                        if FLAGS.reachability_alpha_min >= 0
+                        else 0.0
+                    )
+                    decay_progress = (
+                        (policy_step - reachability_start_step)
+                        / FLAGS.reachability_alpha_decay_steps
+                    )
+                    decay_progress = float(np.clip(decay_progress, 0.0, 1.0))
+                    reachability_alpha_effective = alpha_max + (alpha_min - alpha_max) * decay_progress
+                elif FLAGS.reachability_alpha_warmup_steps > 0:
+                    warmup_progress = (
+                        (policy_step - reachability_start_step)
+                        / FLAGS.reachability_alpha_warmup_steps
+                    )
+                    reachability_alpha_effective = FLAGS.reachability_alpha * float(np.clip(warmup_progress, 0.0, 1.0))
+                else:
+                    reachability_alpha_effective = FLAGS.reachability_alpha
+            else:
+                reachability_alpha_effective = 0.0
+
+        pretrain_batch = pretrain_dataset.sample(
+            FLAGS.batch_size,
+            sample_reachability=reachability_update,
+        )
+        if reachability_pretraining:
+            agent, update_info = supply_rng(agent.pretrain_update)(
+                pretrain_batch,
+                value_update=False,
+                actor_update=False,
+                high_actor_update=False,
+                reachability_update=True,
+                reachability_mod_adv=reachability_mod_adv,
+                reachability_alpha_effective=reachability_alpha_effective,
+            )
+        else:
+            agent, update_info = supply_rng(agent.pretrain_update)(
+                pretrain_batch,
+                reachability_update=reachability_update,
+                reachability_mod_adv=reachability_mod_adv,
+                reachability_alpha_effective=reachability_alpha_effective,
+            )
 
         if i % FLAGS.log_interval == 0:
             debug_statistics = get_debug_statistics(agent, pretrain_batch)
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             train_metrics.update({f'pretraining/debug/{k}': v for k, v in debug_statistics.items()})
+            train_metrics['training/phase/reachability_pretraining'] = float(reachability_pretraining)
+            train_metrics['training/phase/reachability_update'] = float(reachability_update)
+            train_metrics['training/phase/reachability_mod_adv'] = float(reachability_mod_adv)
+            train_metrics['training/phase/reachability_start_step'] = reachability_start_step
+            train_metrics['training/phase/reachability_alpha_effective'] = reachability_alpha_effective
+            train_metrics['training/phase/policy_step'] = max(policy_step, 0)
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = (time.time() - first_time)
             last_time = time.time()
             wandb.log(train_metrics, step=i)
             train_logger.log(train_metrics, step=i)
 
-        if i == 1 or i % FLAGS.eval_interval == 0:
+        if policy_step > 0 and (policy_step == 1 or policy_step % FLAGS.eval_interval == 0):
             policy_fn = partial(supply_rng(agent.sample_actions), discrete=discrete)
             if FLAGS.use_reachability and FLAGS.use_waypoints and FLAGS.reachability_filter_policy:
                 high_policy_fn = partial(supply_rng(agent.sample_reachable_high_actions))
@@ -513,7 +694,12 @@ def main(_):
                 )
                 eval_metrics = {f'evaluation/{k}': v for k, v in eval_info.items()}
                 if FLAGS.use_reachability and FLAGS.use_waypoints:
-                    reachability_stats, reachability_rows = get_eval_reachability_stats(agent, trajs, use_rep=FLAGS.use_rep)
+                    reachability_stats, reachability_rows = get_eval_reachability_stats(
+                        agent,
+                        trajs,
+                        use_rep=FLAGS.use_rep,
+                        reachability_alpha_effective=reachability_alpha_effective,
+                    )
                     eval_metrics.update({
                         f'evaluation/{k}': v
                         for k, v in reachability_stats.items()
@@ -552,13 +738,13 @@ def main(_):
             wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
 
-        if i % FLAGS.save_interval == 0:
+        if policy_step > 0 and policy_step % FLAGS.save_interval == 0:
             save_dict = dict(
                 agent=flax.serialization.to_state_dict(agent),
                 config=FLAGS.config.to_dict()
             )
 
-            fname = os.path.join(FLAGS.save_dir, f'params_{i}.pkl')
+            fname = os.path.join(FLAGS.save_dir, f'params_{policy_step}.pkl')
             print(f'Saving to {fname}')
             with open(fname, "wb") as f:
                 pickle.dump(save_dict, f)

@@ -53,7 +53,7 @@ def compute_actor_loss(agent, batch, network_params):
     }
 
 
-def compute_high_actor_loss(agent, batch, network_params):
+def compute_high_actor_loss(agent, batch, network_params, reachability_mod_adv=True, reachability_alpha_effective=0.0):
     cur_goals = batch['high_goals']
     v1, v2 = agent.network(batch['observations'], cur_goals, method='value')
     nv1, nv2 = agent.network(batch['high_targets'], cur_goals, method='value')
@@ -61,20 +61,47 @@ def compute_high_actor_loss(agent, batch, network_params):
     nv = (nv1 + nv2) / 2
 
     adv = nv - v
-    exp_a = jnp.exp(adv * agent.config['high_temperature'])
-    exp_a = jnp.minimum(exp_a, 100.0)
-
-    dist = agent.network(batch['observations'], batch['high_goals'], state_rep_grad=True, goal_rep_grad=True, method='high_actor', params=network_params)
     if agent.config['use_rep']:
         target = agent.network(targets=batch['high_targets'], bases=batch['observations'], method='value_goal_encoder')
+        reachability_goals = target
+        low_dim_goals = True
     else:
         target = batch['high_targets'] - batch['observations']
+        reachability_goals = batch['high_targets']
+        low_dim_goals = False
+
+    if reachability_mod_adv and agent.config['use_reachability_mod_adv'] and agent.config['use_reachability']:
+        reachability = agent.network(
+            batch['observations'],
+            reachability_goals,
+            low_dim_goals=low_dim_goals,
+            state_rep_grad=False,
+            goal_rep_grad=False,
+            method='reachability',
+            params=network_params,
+        )
+        reachability = jax.lax.stop_gradient(reachability)
+        mod_adv = adv + reachability_alpha_effective * reachability * (adv > 0)
+        exp_a = jnp.exp(mod_adv * agent.config['high_temperature'])
+        exp_a = jnp.minimum(exp_a, 100.0)
+    else:
+        reachability = jnp.zeros_like(adv)
+        reachability_alpha_effective = 0.0
+        mod_adv = adv
+        exp_a = jnp.exp(adv * agent.config['high_temperature'])
+        exp_a = jnp.minimum(exp_a, 100.0)
+
+    dist = agent.network(batch['observations'], batch['high_goals'], state_rep_grad=True, goal_rep_grad=True, method='high_actor', params=network_params)
     log_probs = dist.log_prob(target)
     actor_loss = -(exp_a * log_probs).mean()
 
     return actor_loss, {
         'high_actor_loss': actor_loss,
         'high_adv': adv.mean(),
+        'high_mod_adv': mod_adv.mean(),
+        'high_reachability': reachability.mean(),
+        'high_reachability_alpha': reachability_alpha_effective,
+        'high_actor_weight': exp_a.mean(),
         'high_bc_log_probs': log_probs.mean(),
         'high_adv_median': jnp.median(adv),
         'high_mse': jnp.mean((dist.mode() - target)**2),
@@ -146,7 +173,7 @@ def compute_reachability_loss(agent, batch, network_params):
 class JointTrainAgent(iql.IQLAgent):
     network: TrainState = None
 
-    def pretrain_update(agent, pretrain_batch, seed=None, value_update=True, actor_update=True, high_actor_update=True, reachability_update=True):
+    def pretrain_update(agent, pretrain_batch, seed=None, value_update=True, actor_update=True, high_actor_update=True, reachability_update=True, reachability_mod_adv=True, reachability_alpha_effective=0.0):
         def loss_fn(network_params):
             info = {}
 
@@ -168,7 +195,13 @@ class JointTrainAgent(iql.IQLAgent):
 
             # High Actor
             if high_actor_update and agent.config['use_waypoints']:
-                high_actor_loss, high_actor_info = compute_high_actor_loss(agent, pretrain_batch, network_params)
+                high_actor_loss, high_actor_info = compute_high_actor_loss(
+                    agent,
+                    pretrain_batch,
+                    network_params,
+                    reachability_mod_adv=reachability_mod_adv,
+                    reachability_alpha_effective=reachability_alpha_effective,
+                )
                 for k, v in high_actor_info.items():
                     info[f'high_actor/{k}'] = v
             else:
@@ -192,13 +225,18 @@ class JointTrainAgent(iql.IQLAgent):
 
         new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn, has_aux=True)
 
+        if agent.config['use_reachability'] and not reachability_update:
+            params = unfreeze(new_network.params)
+            params['networks_reachability'] = agent.network.params['networks_reachability']
+            new_network = new_network.replace(params=freeze(params))
+
         if value_update:
             params = unfreeze(new_network.params)
             params['networks_target_value'] = new_target_params
             new_network = new_network.replace(params=freeze(params))
 
         return agent.replace(network=new_network), info
-    pretrain_update = jax.jit(pretrain_update, static_argnames=('value_update', 'actor_update', 'high_actor_update', 'reachability_update'))
+    pretrain_update = jax.jit(pretrain_update, static_argnames=('value_update', 'actor_update', 'high_actor_update', 'reachability_update', 'reachability_mod_adv'))
 
     def sample_actions(agent,
                        observations: np.ndarray,
@@ -268,6 +306,15 @@ class JointTrainAgent(iql.IQLAgent):
     predict_reachability = jax.jit(predict_reachability, static_argnames=('low_dim_goals',))
 
     @jax.jit
+    def predict_value_advantage(agent,
+                                observations: np.ndarray,
+                                next_observations: np.ndarray,
+                                goals: np.ndarray) -> jnp.ndarray:
+        v1, v2 = agent.network(observations, goals, method='value')
+        nv1, nv2 = agent.network(next_observations, goals, method='value')
+        return (nv1 + nv2 - v1 - v2) / 2
+
+    @jax.jit
     def get_value_goal_rep(agent,
                            *,
                            targets: np.ndarray,
@@ -311,6 +358,8 @@ def create_learner(
         reachability_loss_weight: float = 1.0,
         reachability_threshold: float = 0.5,
         reachability_resample_attempts: int = 10,
+        use_reachability_mod_adv: int = 0,
+        reachability_alpha: float = 0.1,
         **kwargs):
 
         print('Extra kwargs:', kwargs)
@@ -396,6 +445,7 @@ def create_learner(
             use_rep=use_rep, use_waypoints=use_waypoints,
             use_reachability=use_reachability, reachability_loss_weight=reachability_loss_weight,
             reachability_threshold=reachability_threshold, reachability_resample_attempts=reachability_resample_attempts,
+            use_reachability_mod_adv=use_reachability_mod_adv, reachability_alpha=reachability_alpha,
         ))
 
         return JointTrainAgent(rng, network=network, critic=None, value=None, target_value=None, actor=None, config=config)
@@ -415,6 +465,8 @@ def get_default_config():
         'reachability_loss_weight': 1.0,
         'reachability_threshold': 0.5,
         'reachability_resample_attempts': 10,
+        'use_reachability_mod_adv': 0,
+        'reachability_alpha': 0.1,
     })
 
     return config
